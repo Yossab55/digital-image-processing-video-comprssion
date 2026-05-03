@@ -1,4 +1,3 @@
-# Hello world
 %% Video Compression Project Steps 4 to 7
 
 clear; clc; close all;
