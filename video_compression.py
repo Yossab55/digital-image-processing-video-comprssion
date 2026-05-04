@@ -1,8 +1,3 @@
-"""
-Video Compression Pipeline - Optimized Core Engine
-Suez Canal University - Faculty of Computers and Informatics
-"""
-
 import cv2, os, heapq
 import numpy as np
 from scipy.fft import dctn, idctn

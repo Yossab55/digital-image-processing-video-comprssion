@@ -1,8 +1,3 @@
-"""
-Video Compression Pipeline - Complete GUI with Side-by-Side Video Display
-Suez Canal University - Faculty of Computers and Informatics
-"""
-
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import matplotlib.pyplot as plt
