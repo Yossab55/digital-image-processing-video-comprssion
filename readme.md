@@ -18,7 +18,7 @@
 
 - Install packages
 
-  `sounddevice numpy opencv-python scipy matplotlib pillow`
+  `pip install sounddevice numpy opencv-python scipy matplotlib pillow`
 
 - Run the code
 
