@@ -1,4 +1,0 @@
-in python: 
-# pip install opencv-python numpy scipy matplotlib
-pip install streamlit opencv-python numpy scipy matplotlib
-python video_compression.py
