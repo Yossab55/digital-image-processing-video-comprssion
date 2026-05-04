@@ -1,721 +1,543 @@
 """
-Video Compression Project - Complete Pipeline (Steps 1 to 7)
-Suez Canal University - Faculty of Computers and Informatics
-Computer Science Department
+Video Compression Pipeline - Steps 1 to 7
+Suez Canal University | Faculty of Computers and Informatics
+=========================================================
+Implements a simplified H.264-style codec:
+  Step 1 - Video Input & YCbCr Conversion
+  Step 2 - Frame Type Assignment (I / P frames)
+  Step 3 - Intra-frame Compression  (DCT + Quantization + RLE)
+  Step 4 - Inter-frame Compression  (Block Matching + Residuals)
+  Step 5 - Entropy Coding           (Manual Huffman)
+  Step 6 - Bitstream Formation
+  Step 7 - Decoding & Evaluation    (PSNR + Compression Ratio)
 
-Python equivalent of the MATLAB implementation.
-Requirements: pip install opencv-python numpy scipy matplotlib
+All 7 steps are visualised in ONE combined figure at the end.
+
+Install: pip install opencv-python numpy scipy matplotlib
 """
 
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
+import cv2, numpy as np, matplotlib.pyplot as plt, matplotlib.patches as mpatches
 from scipy.fft import dctn, idctn
 from collections import Counter
-import heapq
-import os
-import sys
+import heapq, os
+import matplotlib
+matplotlib.use('Agg')  # non-GUI backend
 
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
+# ─────────────────────────────────────────────
+# CONFIGURATION  (tweak these to explore)
+# ─────────────────────────────────────────────
+VIDEO_PATH   = "./Thumbs-up.mp4"   # Supply your own video or leave as-is for synthetic
+BLOCK_SIZE   = 8                # Standard JPEG/H.264 macro-block size
+Q_SCALAR     = 10.0             # Quantisation step: larger = more compression, less quality
+Q_MAT        = np.ones((8,8)) * Q_SCALAR   # Flat quantisation matrix (uniform quality)
+SEARCH_RANGE = 4                # Motion-vector search radius in pixels (±4 px)
+I_INTERVAL   = 10               # Insert an I-frame every N frames (like Group-of-Pictures)
+Q_STEP_HUFF  = 10               # Quantisation step applied before Huffman symbol mapping
+
+
+# ─────────────────────────────────────────────
+# HELPER UTILITIES
+# ─────────────────────────────────────────────
 
 def zigzag_scan(block):
-    """Zig-zag scan of an 8x8 block into a 1x64 array."""
-    order = np.array([
-         1,  2,  6,  7, 15, 16, 28, 29,
-         3,  5,  8, 14, 17, 27, 30, 43,
-         4,  9, 13, 18, 26, 31, 42, 44,
-        10, 12, 19, 25, 32, 41, 45, 54,
-        11, 20, 24, 33, 40, 46, 53, 55,
-        21, 23, 34, 39, 47, 52, 56, 61,
-        22, 35, 38, 48, 51, 57, 60, 62,
-        36, 37, 49, 50, 58, 59, 63, 64
-    ]).reshape(8, 8) - 1  # 0-indexed
-
+    """Re-order an 8×8 DCT block into a 1-D array using zig-zag traversal.
+    This groups the low-frequency (important) coefficients at the start
+    and high-frequency (near-zero after quantisation) ones at the end,
+    maximising the run-length of zeros for better RLE compression."""
+    order = (np.array([
+         1, 2, 6, 7,15,16,28,29,
+         3, 5, 8,14,17,27,30,43,
+         4, 9,13,18,26,31,42,44,
+        10,12,19,25,32,41,45,54,
+        11,20,24,33,40,46,53,55,
+        21,23,34,39,47,52,56,61,
+        22,35,38,48,51,57,60,62,
+        36,37,49,50,58,59,63,64
+    ]).reshape(8,8) - 1)
     flat = np.zeros(64)
     for r in range(8):
         for c in range(8):
-            flat[order[r, c]] = block[r, c]
+            flat[order[r,c]] = block[r,c]
     return flat
 
 
 def rle_encode(arr):
-    """Run-Length Encoding: returns list of (value, count) pairs."""
-    encoded = []
-    count = 1
+    """Run-Length Encoding: collapse consecutive identical values into (value, count) pairs.
+    Especially effective after zig-zag scan because long runs of zeros appear at the tail."""
+    enc, count = [], 1
     for i in range(1, len(arr)):
-        if arr[i] == arr[i - 1]:
-            count += 1
-        else:
-            encoded.append((arr[i - 1], count))
-            count = 1
-    encoded.append((arr[-1], count))
-    return encoded
+        if arr[i] == arr[i-1]: count += 1
+        else: enc.append((arr[i-1], count)); count = 1
+    enc.append((arr[-1], count))
+    return enc
 
 
-def rle_decode(encoded):
-    """Decode RLE pairs back to flat array."""
+def rle_decode(enc):
+    """Reverse RLE: expand (value, count) pairs back to a flat array."""
     arr = []
-    for val, count in encoded:
-        arr.extend([val] * int(count))
+    for val, cnt in enc:
+        arr.extend([val]*int(cnt))
     return np.array(arr)
 
 
-def reconstruct_iframe(compressed_frame, Q, h, w, block_size=8):
-    """Reconstruct Y channel from RLE+DCT compressed I-frame data."""
-    Y_recon = np.zeros((h, w))
-    num_bh = h // block_size
-    num_bw = w // block_size
-    block_num = 0
-
-    for row in range(num_bh):
-        for col in range(num_bw):
-            if block_num >= len(compressed_frame):
-                break
-            encoded = compressed_frame[block_num]
-            flat = rle_decode(encoded)
-            if len(flat) < 64:
-                flat = np.pad(flat, (0, 64 - len(flat)))
-            q_block = flat[:64].reshape(8, 8)
-            dct_block = q_block * Q
-            block = idctn(dct_block, norm='ortho')
-            r_start = row * block_size
-            c_start = col * block_size
-            Y_recon[r_start:r_start+8, c_start:c_start+8] = block
-            block_num += 1
-
-    return np.clip(Y_recon, 0, 255)
+def reconstruct_iframe(compressed_frame, Q, h, w, bs=8):
+    """Reconstruct the Y-channel of an I-frame from its RLE+DCT compressed blocks.
+    Process: RLE decode → inverse zig-zag (implicit via reshape) → dequantise → IDCT."""
+    Y_rec = np.zeros((h, w))
+    for idx, (row, col) in enumerate(((r,c) for r in range(h//bs) for c in range(w//bs))):
+        if idx >= len(compressed_frame): break
+        flat = rle_decode(compressed_frame[idx])
+        flat = np.pad(flat, (0, max(0, 64-len(flat))))
+        block = idctn((flat[:64].reshape(8,8) * Q), norm='ortho')
+        Y_rec[row*bs:(row+1)*bs, col*bs:(col+1)*bs] = block
+    return np.clip(Y_rec, 0, 255)
 
 
-# ============================================================
-# HUFFMAN CODING (No external library needed)
-# ============================================================
+# ─────────────────────────────────────────────
+# HUFFMAN CODING  (pure Python, no library)
+# ─────────────────────────────────────────────
 
-class HuffmanNode:
-    def __init__(self, symbol, prob):
-        self.symbol = symbol
-        self.prob   = prob
-        self.left   = None
-        self.right  = None
+class _HNode:
+    """Internal Huffman tree node."""
+    def __init__(self, sym, p): self.sym=sym; self.p=p; self.L=self.R=None
+    def __lt__(self, o): return self.p < o.p
 
-    def __lt__(self, other):
-        return self.prob < other.prob
-
-
-def build_huffman_dict(symbols, probs):
-    """Build Huffman dictionary without any external library."""
-    if len(symbols) == 1:
-        return {symbols[0]: '0'}
-
-    heap = [HuffmanNode(s, p) for s, p in zip(symbols, probs)]
+def build_huffman(symbols, probs):
+    """Build a Huffman code dictionary.
+    Greedy min-heap strategy: repeatedly merge the two lowest-probability nodes
+    until only the root remains. Frequent symbols → short codes; rare → long codes."""
+    if len(symbols)==1: return {symbols[0]:'0'}
+    heap = [_HNode(s,p) for s,p in zip(symbols,probs)]
     heapq.heapify(heap)
-
-    while len(heap) > 1:
-        left  = heapq.heappop(heap)
-        right = heapq.heappop(heap)
-        merged = HuffmanNode(None, left.prob + right.prob)
-        merged.left  = left
-        merged.right = right
-        heapq.heappush(heap, merged)
-
-    root = heap[0]
+    while len(heap)>1:
+        L,R = heapq.heappop(heap), heapq.heappop(heap)
+        m = _HNode(None, L.p+R.p); m.L=L; m.R=R
+        heapq.heappush(heap, m)
     codes = {}
-
-    def traverse(node, code):
-        if node is None:
-            return
-        if node.symbol is not None:
-            codes[node.symbol] = code if code else '0'
-            return
-        traverse(node.left,  code + '0')
-        traverse(node.right, code + '1')
-
-    traverse(root, '')
+    def _walk(node, code):
+        if node is None: return
+        if node.sym is not None: codes[node.sym] = code or '0'; return
+        _walk(node.L, code+'0'); _walk(node.R, code+'1')
+    _walk(heap[0],'')
     return codes
 
+def huff_encode(syms, d):
+    return ''.join(d.get(s,'') for s in syms)
 
-def encode_with_dict(symbols, huff_dict):
-    """Encode symbol array to binary string using Huffman dict."""
-    return ''.join(huff_dict.get(s, '') for s in symbols)
-
-
-def huffman_decode(encoded, huff_dict):
-    """Fast Huffman decode using reverse lookup."""
-    reverse = {v: k for k, v in huff_dict.items()}
-    max_len  = max(len(c) for c in reverse)
-    symbols  = []
-    i = 0
+def huff_decode(encoded, d):
+    """Decode a binary string using the reverse Huffman lookup table."""
+    rev = {v:k for k,v in d.items()}
+    maxlen = max(len(c) for c in rev)
+    out, i = [], 0
     while i < len(encoded):
-        matched = False
-        for length in range(1, min(max_len, len(encoded) - i) + 1):
-            codeword = encoded[i:i+length]
-            if codeword in reverse:
-                symbols.append(reverse[codeword])
-                i += length
-                matched = True
-                break
-        if not matched:
-            break
-    return np.array(symbols)
+        for l in range(1, min(maxlen, len(encoded)-i)+1):
+            cw = encoded[i:i+l]
+            if cw in rev: out.append(rev[cw]); i+=l; break
+        else: break
+    return np.array(out)
 
 
-# ============================================================
-# STEP 1: VIDEO INPUT HANDLING
-# معالجة مدخلات الفيديو
-# ============================================================
-# EN: Read the video file frame by frame, then convert each frame
-#     from BGR (OpenCV default) to YCbCr. The Y channel carries
-#     brightness (luma) and is the main channel used for compression.
-#
-# AR: نقرأ ملف الفيديو إطاراً بإطار ونحوله من BGR إلى YCbCr.
-#     قناة Y تحمل السطوع وهي القناة الرئيسية في الضغط.
-
-print("==> STEP 1: Reading video and converting to YUV...")
-
-VIDEO_PATH = "./Street.mp4"
+# ══════════════════════════════════════════════════════════════════
+# STEP 1 — VIDEO INPUT & COLOUR SPACE CONVERSION
+# ══════════════════════════════════════════════════════════════════
+print("► STEP 1  Loading video & converting to YCbCr ...")
 
 if not os.path.exists(VIDEO_PATH):
-    # Generate synthetic video if file not found
-    print(f"   '{VIDEO_PATH}' not found — generating synthetic video...")
-    num_frames_gen = 30
-    H_gen, W_gen   = 120, 160
-    frames_rgb     = []
-    for f in range(num_frames_gen):
-        img = np.zeros((H_gen, W_gen, 3), dtype=np.uint8)
-        offset = (f * 3) % (W_gen - 40)
-        img[30:70, offset:offset+40] = [180, 100, 60]
-        img += np.random.randint(0, 8, img.shape, dtype=np.uint8)
+    # Synthetic fallback: a coloured rectangle that moves across the frame
+    print("  (No video file found — using synthetic 30-frame test video)")
+    H, W, NF = 120, 160, 30
+    frames_rgb = []
+    for f in range(NF):
+        img = np.zeros((H,W,3), dtype=np.uint8)
+        off = (f*3) % (W-40)
+        img[30:70, off:off+40] = [180,100,60]
+        img += np.random.randint(0,8,img.shape, dtype=np.uint8)
         frames_rgb.append(img)
-    print(f"   Synthetic video: {num_frames_gen} frames of {H_gen}x{W_gen}")
 else:
     cap = cv2.VideoCapture(VIDEO_PATH)
     frames_rgb = []
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frames_rgb.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        ret, f = cap.read()
+        if not ret: break
+        frames_rgb.append(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
     cap.release()
-    print(f"   Loaded '{VIDEO_PATH}'")
 
-# Convert to YCbCr and extract Y channel
-yuv_frames = []
-for frame in frames_rgb:
-    # OpenCV YCrCb conversion (equivalent to MATLAB rgb2ycbcr)
-    yuv = cv2.cvtColor(frame, cv2.COLOR_RGB2YCrCb)
-    yuv_frames.append(yuv)
-
-num_frames = len(frames_rgb)
-frame_H    = frames_rgb[0].shape[0]
-frame_W    = frames_rgb[0].shape[1]
-print(f"   Total Frames: {num_frames}  |  Size: {frame_H}x{frame_W}")
-
-# ---- Display: Step 1 ----
-show_idx = np.round(np.linspace(0, num_frames-1, 4)).astype(int)
-fig, axes = plt.subplots(2, 4, figsize=(14, 6))
-fig.suptitle("Step 1: Video Input - RGB vs Y channel | RGB مقابل قناة السطوع", fontsize=11)
-for k, idx in enumerate(show_idx):
-    axes[0, k].imshow(frames_rgb[idx])
-    axes[0, k].set_title(f"RGB Frame {idx+1}", fontsize=8)
-    axes[0, k].axis('off')
-
-    axes[1, k].imshow(yuv_frames[idx][:,:,0], cmap='gray')
-    axes[1, k].set_title(f"Y-channel {idx+1}", fontsize=8)
-    axes[1, k].axis('off')
-plt.tight_layout()
-plt.savefig("step1_output.png", dpi=100, bbox_inches='tight')
-plt.show()
-print("   Figure saved: step1_output.png")
+# Convert each RGB frame to YCrCb  (Y = luma/brightness, used for compression)
+yuv_frames = [cv2.cvtColor(fr, cv2.COLOR_RGB2YCrCb) for fr in frames_rgb]
+NF, H, W = len(frames_rgb), frames_rgb[0].shape[0], frames_rgb[0].shape[1]
+print(f"  {NF} frames  |  {H}×{W} px")
 
 
-# ============================================================
-# STEP 2: FRAME TYPE DECISION
-# تحديد نوع كل إطار
-# ============================================================
-# EN: Every 10th frame (index 0,10,20,...) is an I-frame (Intra),
-#     compressed independently. All others are P-frames (Predictive).
-#
-# AR: كل إطار عاشر I-frame يُضغط باستقلالية، والباقي P-frames.
+# ══════════════════════════════════════════════════════════════════
+# STEP 2 — FRAME TYPE ASSIGNMENT  (I-frame / P-frame)
+# ══════════════════════════════════════════════════════════════════
+print("► STEP 2  Assigning I / P frame types ...")
 
-print("\n==> STEP 2: Assigning frame types...")
-
-frame_types = []
-for f in range(num_frames):
-    frame_types.append('I' if f % 10 == 0 else 'P')
-
-num_I = frame_types.count('I')
-num_P = frame_types.count('P')
-print(f"   I-frames: {num_I}  |  P-frames: {num_P}")
-
-# ---- Display: Step 2 ----
-type_numeric = [1 if t == 'I' else 0 for t in frame_types]
-fig, ax = plt.subplots(figsize=(12, 3))
-ax.stem(range(num_frames), type_numeric, markerfmt='C0o', linefmt='C0-', basefmt='k-')
-ax.set_yticks([0, 1]); ax.set_yticklabels(['P-frame', 'I-frame'])
-ax.set_xlabel('Frame Index | رقم الإطار')
-ax.set_title('Step 2: Frame Type Decision | نوع كل إطار  (I=1 , P=0)')
-ax.grid(True)
-plt.tight_layout()
-plt.savefig("step2_output.png", dpi=100, bbox_inches='tight')
-plt.show()
-print("   Figure saved: step2_output.png")
+# I-frame (Intra): self-contained, compressed independently like a JPEG.
+# P-frame (Predictive): stores only the difference from the previous frame.
+frame_types = ['I' if f % I_INTERVAL == 0 else 'P' for f in range(NF)]
+print(f"  I-frames: {frame_types.count('I')}   P-frames: {frame_types.count('P')}")
 
 
-# ============================================================
-# STEP 3: INTRA-FRAME COMPRESSION (I-FRAMES)
-# ضغط الإطارات المستقلة
-# ============================================================
-# EN: For each I-frame: extract Y channel, divide into 8x8 blocks,
-#     apply DCT2, quantize, zig-zag scan, then RLE encode.
-#
-# AR: لكل I-frame: استخرج Y، قسّم إلى كتل 8x8، طبّق DCT2،
-#     كمّم، مسح zig-zag، ثم RLE.
+# ══════════════════════════════════════════════════════════════════
+# STEP 3 — INTRA-FRAME COMPRESSION  (DCT + Quantise + Zig-Zag + RLE)
+# ══════════════════════════════════════════════════════════════════
+print("► STEP 3  Compressing I-frames (DCT → Quantise → Zig-Zag → RLE) ...")
 
-print("\n==> STEP 3: I-frame compression (DCT + Quantization + RLE)...")
+compressed_data    = [None]*NF   # Stores RLE-encoded blocks per frame
+iframe_Y_quantized = [None]*NF   # Stores quantised DCT maps for display
 
-Q              = np.ones((8, 8)) * 10.0
-block_size     = 8
-compressed_data     = [None] * num_frames
-iframe_Y_quantized  = [None] * num_frames
-
-for f in range(num_frames):
-    if frame_types[f] == 'I':
-        Y     = yuv_frames[f][:,:,0].astype(float)
-        h, w  = Y.shape
-        compressed_frame = []
-        q_Y  = np.zeros((h, w))
-
-        for x in range(0, h - block_size + 1, block_size):
-            for y in range(0, w - block_size + 1, block_size):
-                block     = Y[x:x+8, y:y+8]
-                dct_block = dctn(block, norm='ortho')
-                q_block   = np.round(dct_block / Q)
-
-                flat    = zigzag_scan(q_block)
-                encoded = rle_encode(flat)
-
-                compressed_frame.append(encoded)
-                q_Y[x:x+8, y:y+8] = q_block
-
-        compressed_data[f]     = compressed_frame
-        iframe_Y_quantized[f]  = q_Y
-        print(f"   Frame {f+1:2d} [I] compressed into {len(compressed_frame)} blocks")
-
-# ---- Display: Step 3 ----
-first_I = next(f for f, t in enumerate(frame_types) if t == 'I')
-Y_orig  = yuv_frames[first_I][:,:,0].astype(float)
-Y_recon = reconstruct_iframe(compressed_data[first_I], Q,
-                              Y_orig.shape[0], Y_orig.shape[1], block_size)
-
-fig, axes = plt.subplots(1, 3, figsize=(13, 4))
-fig.suptitle("Step 3: Intra-frame Compression (DCT + RLE) | ضغط الإطارات المستقلة", fontsize=11)
-
-axes[0].imshow(Y_orig, cmap='gray', vmin=0, vmax=255)
-axes[0].set_title(f"Original Y-channel (Frame {first_I+1}) | الأصلي")
-axes[0].axis('off')
-
-axes[1].imshow(iframe_Y_quantized[first_I], cmap='gray')
-axes[1].set_title("Quantized DCT Coefficients | معاملات DCT المكمّمة")
-axes[1].axis('off')
-
-axes[2].imshow(Y_recon, cmap='gray', vmin=0, vmax=255)
-axes[2].set_title("Reconstructed I-frame | الإطار المعاد بناؤه")
-axes[2].axis('off')
-
-plt.tight_layout()
-plt.savefig("step3_output.png", dpi=100, bbox_inches='tight')
-plt.show()
-print("   Figure saved: step3_output.png")
+for f in range(NF):
+    if frame_types[f] != 'I': continue
+    Y = yuv_frames[f][:,:,0].astype(float)
+    h, w = Y.shape
+    cf, qY = [], np.zeros((h,w))
+    for r in range(0, h-BLOCK_SIZE+1, BLOCK_SIZE):
+        for c in range(0, w-BLOCK_SIZE+1, BLOCK_SIZE):
+            blk   = Y[r:r+8, c:c+8]
+            dct_b = dctn(blk, norm='ortho')           # 2-D DCT (energy compaction)
+            q_b   = np.round(dct_b / Q_MAT)           # Quantise: reduces precision of HF
+            cf.append(rle_encode(zigzag_scan(q_b)))   # Zig-zag then RLE
+            qY[r:r+8, c:c+8] = q_b
+    compressed_data[f] = cf
+    iframe_Y_quantized[f] = qY
+    print(f"  Frame {f+1:3d} [I]  {len(cf)} blocks compressed")
 
 
-# ============================================================
-# STEP 4: INTER-FRAME COMPRESSION (P-FRAMES)
-# ضغط الإطارات التنبؤية
-# ============================================================
-# EN: P-frames store only the DIFFERENCE from the previous frame.
-#     Block Matching finds motion vectors (dy,dx) for each 8x8 block.
-#     residual = current block - predicted block.
-#
-# AR: الـ P-frames تخزّن فقط الفرق عن الإطار السابق.
-#     مطابقة الكتل تجد متجهات الحركة لكل كتلة 8x8.
-#     الباقي = الكتلة الحالية - الكتلة المتوقعة.
+# ══════════════════════════════════════════════════════════════════
+# STEP 4 — INTER-FRAME COMPRESSION  (Block Matching + Residuals)
+# ══════════════════════════════════════════════════════════════════
+print("► STEP 4  Compressing P-frames (Block Matching → Residuals) ...")
 
-print("\n==> STEP 4: Inter-frame Compression (P-frames - Block Matching)...")
+motion_vectors = [None]*NF
+residuals      = [None]*NF
 
-search_range   = 4
-motion_vectors = [None] * num_frames
-residuals      = [None] * num_frames
-
-for f in range(num_frames):
-    current_frame = yuv_frames[f][:,:,0].astype(float)
-    h, w = current_frame.shape
+for f in range(NF):
+    Y_cur = yuv_frames[f][:,:,0].astype(float)
+    h, w  = Y_cur.shape
 
     if frame_types[f] == 'I':
+        # I-frames: reconstruct immediately so P-frames can use them as reference
         motion_vectors[f] = None
-        residuals[f] = reconstruct_iframe(compressed_data[f], Q, h, w, block_size)
-        print(f"   Frame {f+1:2d} -> I-frame")
+        residuals[f] = reconstruct_iframe(compressed_data[f], Q_MAT, h, w, BLOCK_SIZE)
+        continue
 
-    else:
-        ref_frame = yuv_frames[f-1][:,:,0].astype(float)
-        num_bh = h // block_size
-        num_bw = w // block_size
-        mvs         = np.zeros((num_bh * num_bw, 2), dtype=int)
-        residual_img = np.zeros((h, w))
+    # For P-frames: search the previous frame for the best-matching block
+    # Motion Vector (dy,dx): tells the decoder where the block "came from"
+    Y_ref = yuv_frames[f-1][:,:,0].astype(float)
+    nbh, nbw = h//BLOCK_SIZE, w//BLOCK_SIZE
+    mvs  = np.zeros((nbh*nbw, 2), dtype=int)
+    res  = np.zeros((h, w))
 
-        block_num = 0
-        for row in range(num_bh):
-            for col in range(num_bw):
-                r_start = row * block_size
-                c_start = col * block_size
-                r_end   = r_start + block_size
-                c_end   = c_start + block_size
+    for idx, (row, col) in enumerate(((r,c) for r in range(nbh) for c in range(nbw))):
+        rs, cs = row*BLOCK_SIZE, col*BLOCK_SIZE
+        blk = Y_cur[rs:rs+8, cs:cs+8]
+        best_mad, bdy, bdx = np.inf, 0, 0
+        for dy in range(-SEARCH_RANGE, SEARCH_RANGE+1):
+            for dx in range(-SEARCH_RANGE, SEARCH_RANGE+1):
+                rr, rc = rs+dy, cs+dx
+                if rr<0 or rc<0 or rr+8>h or rc+8>w: continue
+                mad = np.mean(np.abs(blk - Y_ref[rr:rr+8, rc:rc+8]))
+                if mad < best_mad: best_mad,bdy,bdx = mad,dy,dx
+        mvs[idx] = [bdy, bdx]
+        rr = np.clip(rs+bdy, 0, h-8); rc = np.clip(cs+bdx, 0, w-8)
+        res[rs:rs+8, cs:cs+8] = blk - Y_ref[rr:rr+8, rc:rc+8]  # residual error
 
-                current_block = current_frame[r_start:r_end, c_start:c_end]
-
-                best_mad = np.inf
-                best_dy, best_dx = 0, 0
-
-                for dy in range(-search_range, search_range + 1):
-                    for dx in range(-search_range, search_range + 1):
-                        r_ref = r_start + dy
-                        c_ref = c_start + dx
-                        if (r_ref < 0 or c_ref < 0 or
-                                r_ref + block_size > h or c_ref + block_size > w):
-                            continue
-                        ref_block = ref_frame[r_ref:r_ref+block_size, c_ref:c_ref+block_size]
-                        mad = np.mean(np.abs(current_block - ref_block))
-                        if mad < best_mad:
-                            best_mad = mad
-                            best_dy, best_dx = dy, dx
-
-                mvs[block_num] = [best_dy, best_dx]
-
-                r_ref = np.clip(r_start + best_dy, 0, h - block_size)
-                c_ref = np.clip(c_start + best_dx, 0, w - block_size)
-                predicted_block = ref_frame[r_ref:r_ref+block_size, c_ref:c_ref+block_size]
-                residual_img[r_start:r_end, c_start:c_end] = current_block - predicted_block
-
-                block_num += 1
-
-        motion_vectors[f] = mvs
-        residuals[f]      = residual_img
-        mean_mv = np.mean(np.sqrt(np.sum(mvs**2, axis=1)))
-        print(f"   Frame {f+1:2d} -> P-frame | Mean MV: {mean_mv:.2f} px")
-
-# ---- Display: Step 4 ----
-first_P = next(f for f, t in enumerate(frame_types) if t == 'P')
-h_f, w_f = residuals[first_P].shape
-num_bh   = h_f // block_size
-num_bw   = w_f // block_size
-
-fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-fig.suptitle("Step 4: Inter-frame Compression | ضغط الإطارات التنبؤية", fontsize=11)
-
-axes[0].imshow(yuv_frames[first_P][:,:,0], cmap='gray', vmin=0, vmax=255)
-axes[0].set_title(f"Frame {first_P+1} - Original Y | الأصلي")
-axes[0].axis('off')
-
-im = axes[1].imshow(residuals[first_P], cmap='gray')
-axes[1].set_title(f"Frame {first_P+1} - Residual | الباقي")
-axes[1].axis('off')
-plt.colorbar(im, ax=axes[1])
-
-mvs_p = motion_vectors[first_P]
-cols, rows = np.meshgrid(np.arange(1, num_bw+1), np.arange(1, num_bh+1))
-mv_dy = mvs_p[:,0].reshape(num_bh, num_bw)
-mv_dx = mvs_p[:,1].reshape(num_bh, num_bw)
-axes[2].quiver(cols, rows, mv_dx, mv_dy, color='red', scale=30)
-axes[2].set_xlim(0, num_bw+1); axes[2].set_ylim(0, num_bh+1)
-axes[2].invert_yaxis()
-axes[2].set_title(f"Motion Vectors (Frame {first_P+1}) | متجهات الحركة")
-axes[2].set_xlabel("Block Col"); axes[2].set_ylabel("Block Row")
-
-plt.tight_layout()
-plt.savefig("step4_output.png", dpi=100, bbox_inches='tight')
-plt.show()
-print("   Figure saved: step4_output.png")
+    motion_vectors[f] = mvs
+    residuals[f] = res
+    print(f"  Frame {f+1:3d} [P]  Mean MV magnitude: {np.mean(np.sqrt(np.sum(mvs**2,1))):.2f} px")
 
 
-# ============================================================
-# STEP 5: ENTROPY CODING (Manual Huffman)
-# الترميز بالإنتروبيا - هافمان
-# ============================================================
-# EN: Huffman coding assigns shorter codes to frequent values and
-#     longer codes to rare values. Applied to motion vectors and
-#     residuals. Built manually with no external library.
-#
-# AR: هافمان يعطي رموزاً أقصر للقيم الأكثر تكراراً.
-#     نبني الشجرة يدوياً بدون أي مكتبة خارجية.
+# ══════════════════════════════════════════════════════════════════
+# STEP 5 — ENTROPY CODING  (Manual Huffman)
+# ══════════════════════════════════════════════════════════════════
+print("► STEP 5  Entropy coding with Huffman ...")
 
-print("\n==> STEP 5: Entropy Coding (Manual Huffman)...")
+enc_streams  = [None]*NF
+huff_dicts   = [None]*NF
+orig_bits    = np.zeros(NF)
+enc_bits     = np.zeros(NF)
 
-q_step            = 10
-encoded_streams   = [None] * num_frames
-huffman_dicts     = [None] * num_frames
-original_size_bits = np.zeros(num_frames)
-encoded_size_bits  = np.zeros(num_frames)
-
-for f in range(num_frames):
+for f in range(NF):
+    # Flatten all values that need to be transmitted for this frame
     if frame_types[f] == 'I':
-        quantized = np.round(residuals[f] / q_step).astype(int)
-        symbols   = quantized.flatten()
+        syms = np.round(residuals[f] / Q_STEP_HUFF).astype(int).flatten()
     else:
-        mv_flat   = motion_vectors[f].flatten()
-        res_quant = np.round(residuals[f].flatten() / q_step).astype(int)
-        symbols   = np.concatenate([mv_flat, res_quant])
+        mv_flat  = motion_vectors[f].flatten()
+        res_flat = np.round(residuals[f].flatten() / Q_STEP_HUFF).astype(int)
+        syms     = np.concatenate([mv_flat, res_flat])
 
-    unique_syms, counts = np.unique(symbols, return_counts=True)
-    probs = counts / counts.sum()
+    uniq, cnt = np.unique(syms, return_counts=True)
+    hd = build_huffman(uniq.tolist(), (cnt/cnt.sum()).tolist())
+    enc = huff_encode(syms.tolist(), hd)
 
-    huff_dict = build_huffman_dict(unique_syms.tolist(), probs.tolist())
-    encoded   = encode_with_dict(symbols.tolist(), huff_dict)
-
-    encoded_streams[f]      = encoded
-    huffman_dicts[f]        = huff_dict
-    original_size_bits[f]   = len(symbols) * 8
-    encoded_size_bits[f]    = len(encoded)
-
-    ratio = original_size_bits[f] / max(encoded_size_bits[f], 1)
-    print(f"   Frame {f+1:2d} [{frame_types[f]}] | "
-          f"Orig: {int(original_size_bits[f]):6d} bits | "
-          f"Huffman: {int(encoded_size_bits[f]):6d} bits | "
-          f"Ratio: {ratio:.2f}")
-
-# ---- Display: Step 5 ----
-x = np.arange(num_frames)
-fig, axes = plt.subplots(1, 2, figsize=(13, 4))
-fig.suptitle("Step 5: Entropy Coding Results | نتائج الترميز بالإنتروبيا", fontsize=11)
-
-axes[0].bar(x, original_size_bits, color=[0.2, 0.5, 0.8], label='Original Bits | الأصلي')
-axes[0].bar(x, encoded_size_bits,  color=[0.9, 0.3, 0.3], label='Huffman Encoded | بعد هافمان')
-axes[0].set_xlabel('Frame Number | رقم الإطار')
-axes[0].set_ylabel('Bits')
-axes[0].set_title('Bit Usage per Frame | حجم البيانات لكل إطار')
-axes[0].legend(); axes[0].grid(True)
-
-cr_per_frame = original_size_bits / np.maximum(encoded_size_bits, 1)
-axes[1].plot(cr_per_frame, 'g-o', linewidth=1.5)
-axes[1].set_xlabel('Frame Number | رقم الإطار')
-axes[1].set_ylabel('Compression Ratio | نسبة الضغط')
-axes[1].set_title('Huffman Ratio per Frame | نسبة ضغط هافمان لكل إطار')
-axes[1].grid(True)
-
-plt.tight_layout()
-plt.savefig("step5_output.png", dpi=100, bbox_inches='tight')
-plt.show()
-print("   Figure saved: step5_output.png")
+    enc_streams[f] = enc;  huff_dicts[f] = hd
+    orig_bits[f]   = len(syms)*8          # 8 bits/symbol uncompressed
+    enc_bits[f]    = len(enc)             # variable-length after Huffman
+    print(f"  Frame {f+1:3d} [{frame_types[f]}]  {int(orig_bits[f]):7d}→{int(enc_bits[f]):7d} bits  ratio={orig_bits[f]/max(enc_bits[f],1):.2f}×")
 
 
-# ============================================================
-# STEP 6: BITSTREAM FORMATION
-# تكوين تدفق البيانات
-# ============================================================
-# EN: Package all encoded frames into a single bitstream.
-#     Each frame has a header (index, type, size) like H.264.
-#
-# AR: نعبّئ جميع الإطارات في تدفق بيانات واحد مع رأس لكل إطار.
+# ══════════════════════════════════════════════════════════════════
+# STEP 6 — BITSTREAM FORMATION
+# ══════════════════════════════════════════════════════════════════
+print("► STEP 6  Forming bitstream ...")
 
-print("\n==> STEP 6: Bitstream Formation...")
+HEADER_BITS = 72   # 32b frame-index + 8b type + 32b payload-size  (like NAL units in H.264)
+bitstream   = {'header': dict(num_frames=NF,H=H,W=W,bs=BLOCK_SIZE,q=Q_STEP_HUFF), 'frames':[]}
+total_bits  = 0
 
-bitstream = {
-    'header': {
-        'num_frames': num_frames,
-        'frame_H':    frame_H,
-        'frame_W':    frame_W,
-        'block_size': block_size,
-        'q_step':     q_step,
-    },
-    'frames': []
-}
+for f in range(NF):
+    fb = HEADER_BITS + int(enc_bits[f])
+    bitstream['frames'].append(dict(
+        index=f, type=frame_types[f],
+        enc=enc_streams[f], hd=huff_dicts[f], total=fb))
+    total_bits += fb
 
-total_bitstream_bits = 0
-
-for f in range(num_frames):
-    header_bits = 72   # 32b index + 8b type + 32b size
-    data_bits   = int(encoded_size_bits[f])
-    frame_total = header_bits + data_bits
-
-    bitstream['frames'].append({
-        'index':        f,
-        'type':         frame_types[f],
-        'encoded_data': encoded_streams[f],
-        'huff_dict':    huffman_dicts[f],
-        'total_bits':   frame_total,
-    })
-
-    total_bitstream_bits += frame_total
-    print(f"   Frame {f+1:2d} [{frame_types[f]}] packaged | {frame_total} bits")
-
-raw_video_bytes = frame_H * frame_W * num_frames
-print(f"\n   TOTAL Bitstream : {total_bitstream_bits/8/1024:.2f} KB")
-print(f"   Raw Video Size  : {raw_video_bytes/1024:.2f} KB")
-print(f"   Compression Ratio: {(raw_video_bytes*8)/total_bitstream_bits:.2f}x")
-
-# ---- Display: Step 6 ----
-frame_bits = [bitstream['frames'][f]['total_bits'] for f in range(num_frames)]
-bar_colors = ['#D93333' if frame_types[f] == 'I' else '#3399D9' for f in range(num_frames)]
-
-fig, axes = plt.subplots(1, 2, figsize=(13, 4))
-fig.suptitle("Step 6: Bitstream Formation | تكوين تدفق البيانات", fontsize=11)
-
-axes[0].bar(range(num_frames), frame_bits, color=bar_colors)
-axes[0].set_xlabel('Frame Index | رقم الإطار')
-axes[0].set_ylabel('Bits')
-axes[0].set_title('Bits per Frame | حجم كل إطار في التدفق')
-i_patch = mpatches.Patch(color='#D93333', label='I-frame')
-p_patch = mpatches.Patch(color='#3399D9', label='P-frame')
-axes[0].legend(handles=[i_patch, p_patch]); axes[0].grid(True)
-
-axes[1].bar(['Raw Video | الخام', 'Compressed | المضغوط'],
-            [raw_video_bytes * 8, total_bitstream_bits],
-            color=[0.4, 0.7, 0.4])
-axes[1].set_ylabel('Total Bits')
-axes[1].set_title(f"Overall Compression: {(raw_video_bytes*8)/total_bitstream_bits:.2f}x | نسبة الضغط الكلية")
-axes[1].grid(True)
-
-plt.tight_layout()
-plt.savefig("step6_output.png", dpi=100, bbox_inches='tight')
-plt.show()
-print("   Figure saved: step6_output.png")
+raw_bytes = H * W * NF   # Raw = 1 byte per pixel (Y channel only)
+print(f"  Compressed : {total_bits/8/1024:.1f} KB   Raw: {raw_bytes/1024:.1f} KB   CR: {raw_bytes*8/total_bits:.2f}×")
 
 
-# ============================================================
-# STEP 7: TESTING & EVALUATION (PSNR + Compression Ratio)
-# الاختبار والتقييم
-# ============================================================
-# EN: Decode the bitstream back to video frames and compare with
-#     originals using PSNR. PSNR > 30 dB = acceptable,  > 40 dB = excellent.
-#
-# AR: نفك ضغط التدفق ونقارن بالأصلي باستخدام PSNR.
-#     فوق 30 ديسيبل مقبول، فوق 40 ممتاز.
+# ══════════════════════════════════════════════════════════════════
+# STEP 7 — DECODING & EVALUATION  (PSNR + Compression Ratio)
+# ══════════════════════════════════════════════════════════════════
+print("► STEP 7  Decoding and evaluating PSNR ...")
 
-print("\n==> STEP 7: Decoding and Evaluation (PSNR)...")
+# PSNR (Peak Signal-to-Noise Ratio):
+#   > 40 dB  → Excellent (near-lossless perceptually)
+#   30–40 dB → Acceptable (visible but minor artefacts)
+#   < 30 dB  → Noticeable quality loss
 
-decoded_frames = np.zeros((frame_H, frame_W, num_frames))
-psnr_values    = np.zeros(num_frames)
+decoded = np.zeros((H, W, NF))
+psnr    = np.zeros(NF)
 
-for f in range(num_frames):
-    fd = bitstream['frames'][f]
-    decoded_symbols = huffman_decode(fd['encoded_data'], fd['huff_dict'])
-
-    h_f = yuv_frames[f][:,:,0].shape[0]
-    w_f = yuv_frames[f][:,:,0].shape[1]
-    num_bh = h_f // block_size
-    num_bw = w_f // block_size
+for f in range(NF):
+    fd  = bitstream['frames'][f]
+    sym = huff_decode(fd['enc'], fd['hd'])
+    nbh, nbw = H//BLOCK_SIZE, W//BLOCK_SIZE
 
     if fd['type'] == 'I':
-        num_pixels    = num_bh * num_bw * block_size * block_size
-        decoded_quant = decoded_symbols[:num_pixels]
-        reconstructed = decoded_quant.astype(float) * q_step
-        reconstructed = reconstructed.reshape(h_f, w_f)
-        reconstructed = np.clip(reconstructed, 0, 255)
-        decoded_frames[:,:,f] = reconstructed[:frame_H, :frame_W]
+        npix = nbh*nbw*BLOCK_SIZE**2
+        rec  = np.pad(sym, (0,max(0,npix-len(sym))))[:npix].astype(float) * Q_STEP_HUFF
+        decoded[:,:,f] = np.clip(rec.reshape(H,W), 0, 255)
 
     else:
-        num_blocks   = num_bh * num_bw
-        num_mv_syms  = num_blocks * 2
-        num_pixels   = num_bh * num_bw * block_size * block_size
+        nb = nbh*nbw
+        nmv = nb*2
+        npix = nb*BLOCK_SIZE**2
+        sym  = np.pad(sym,(0,max(0,nmv+npix-len(sym))))
+        mv_d = sym[:nmv].reshape(nb,2)
+        res  = sym[nmv:nmv+npix].astype(float)*Q_STEP_HUFF
+        res_img = res.reshape(H,W)
+        ref  = decoded[:,:,f-1]
+        pred = np.zeros((H,W))
+        for idx,(row,col) in enumerate(((r,c) for r in range(nbh) for c in range(nbw))):
+            rs,cs = row*BLOCK_SIZE, col*BLOCK_SIZE
+            dy,dx = int(mv_d[idx,0]), int(mv_d[idx,1])
+            rr = np.clip(rs+dy,0,H-8); rc = np.clip(cs+dx,0,W-8)
+            pred[rs:rs+8,cs:cs+8] = ref[rr:rr+8,rc:rc+8]
+        decoded[:,:,f] = np.clip(pred+res_img, 0, 255)
 
-        if len(decoded_symbols) < num_mv_syms + num_pixels:
-            decoded_symbols = np.pad(decoded_symbols,
-                                     (0, num_mv_syms + num_pixels - len(decoded_symbols)))
+    mse     = np.mean((yuv_frames[f][:,:,0].astype(float) - decoded[:,:,f])**2)
+    psnr[f] = 10*np.log10(255**2 / max(mse,1e-10))
+    print(f"  Frame {f+1:3d} [{fd['type']}]  PSNR = {psnr[f]:.1f} dB")
 
-        mv_decoded   = decoded_symbols[:num_mv_syms].reshape(num_blocks, 2)
-        res_decoded  = decoded_symbols[num_mv_syms:num_mv_syms+num_pixels]
-        residual_rec = res_decoded.astype(float) * q_step
-        residual_rec = residual_rec.reshape(h_f, w_f)
+overall_cr   = raw_bytes*8/total_bits
+overall_psnr = np.mean(psnr)
+print(f"\n  ═══ SUMMARY ═══  PSNR={overall_psnr:.1f} dB   CR={overall_cr:.2f}×")
 
-        ref_decoded = decoded_frames[:,:,f-1]
-        predicted   = np.zeros((h_f, w_f))
 
-        block_num = 0
-        for row in range(num_bh):
-            for col in range(num_bw):
-                r_start = row * block_size
-                c_start = col * block_size
-                dy = int(mv_decoded[block_num, 0])
-                dx = int(mv_decoded[block_num, 1])
-                r_ref = np.clip(r_start + dy, 0, h_f - block_size)
-                c_ref = np.clip(c_start + dx, 0, w_f - block_size)
-                predicted[r_start:r_start+block_size, c_start:c_start+block_size] = \
-                    ref_decoded[r_ref:r_ref+block_size, c_ref:c_ref+block_size]
-                block_num += 1
+# ══════════════════════════════════════════════════════════════════
+# COMBINED OUTPUT FIGURE  —  All 7 Steps on One Page
+# ══════════════════════════════════════════════════════════════════
+print("\n► Building combined figure ...")
 
-        reconstructed = np.clip(predicted + residual_rec, 0, 255)
-        decoded_frames[:,:,f] = reconstructed[:frame_H, :frame_W]
+# Indices for representative frames
+si   = np.round(np.linspace(0,NF-1,4)).astype(int)   # 4 evenly-spaced frames
+fi   = next(f for f,t in enumerate(frame_types) if t=='I')   # first I-frame
+fp   = next(f for f,t in enumerate(frame_types) if t=='P')   # first P-frame
+nbh0 = H//BLOCK_SIZE; nbw0 = W//BLOCK_SIZE
+mvs0 = motion_vectors[fp]
 
-    # PSNR
-    orig  = yuv_frames[f][:,:,0].astype(float)
-    recon = decoded_frames[:,:,f]
-    mse   = np.mean((orig - recon) ** 2)
-    psnr_values[f] = 10 * np.log10(255**2 / max(mse, 1e-10))
-    print(f"   Frame {f+1:2d} [{fd['type']}] | PSNR: {psnr_values[f]:.2f} dB")
+fig = plt.figure(figsize=(22, 28), facecolor='#0d1117')
+fig.suptitle(
+    "Video Compression Pipeline  —  Steps 1–7\n"
+    "Suez Canal University · Faculty of Computers and Informatics",
+    fontsize=15, color='white', fontweight='bold', y=0.995)
 
-# ---- Final Summary ----
-overall_psnr = np.mean(psnr_values)
-overall_cr   = (raw_video_bytes * 8) / total_bitstream_bits
+LABEL_STYLE = dict(fontsize=8, color='white')
+TITLE_STYLE = dict(fontsize=9, color='#58a6ff', fontweight='bold')
 
-print("\n==========================================")
-print("  FINAL EVALUATION SUMMARY")
-print("==========================================")
-print(f"  Average PSNR       : {overall_psnr:.2f} dB")
-print(f"  Compression Ratio  : {overall_cr:.2f}x")
-print(f"  Raw Video Size     : {raw_video_bytes/1024:.2f} KB")
-print(f"  Compressed Size    : {total_bitstream_bits/8/1024:.2f} KB")
-print("==========================================")
+def ax_off(ax, title='', img=None, cmap='gray', vmin=None, vmax=None):
+    if img is not None:
+        kw = {}
+        if vmin is not None: kw['vmin']=vmin
+        if vmax is not None: kw['vmax']=vmax
+        ax.imshow(img, cmap=cmap, **kw)
+    ax.axis('off')
+    if title: ax.set_title(title, **TITLE_STYLE)
+    ax.set_facecolor('#0d1117')
 
-# ---- Display: Step 7 - Original vs Decoded ----
-show_frames = list(dict.fromkeys([0, 1,
-                                   next(f for f,t in enumerate(frame_types) if t=='I')+1,
-                                   num_frames-1]))
-show_frames = [f for f in show_frames if f < num_frames][:4]
 
-fig, axes = plt.subplots(2, len(show_frames), figsize=(4*len(show_frames), 6))
-fig.suptitle("Step 7: Original vs Decoded | الأصلي مقابل المُستعاد", fontsize=11)
+# ── Row 1: Step 1  (4 RGB + 4 Y-channel) ──────────────────────
+for k,idx in enumerate(si):
+    ax = fig.add_subplot(8, 8, k+1)
+    ax_off(ax, f"RGB frame {idx+1}", frames_rgb[idx])
+    ax = fig.add_subplot(8, 8, k+5)
+    ax_off(ax, f"Y-channel {idx+1}", yuv_frames[idx][:,:,0], cmap='gray', vmin=0, vmax=255)
 
-for k, f in enumerate(show_frames):
-    axes[0, k].imshow(yuv_frames[f][:,:,0], cmap='gray', vmin=0, vmax=255)
-    axes[0, k].set_title(f"Orig F{f+1} [{frame_types[f]}]", fontsize=8)
-    axes[0, k].axis('off')
+# Step label
+fig.text(0.01, 0.945, "STEP 1\nVideo Input\n& YCbCr", fontsize=8,
+         color='#3fb950', va='top', fontweight='bold')
+fig.text(0.99, 0.945,
+         "Each RGB frame is converted to YCbCr.\n"
+         "The Y (luma) channel carries perceptual brightness\n"
+         "and is the primary channel for compression.",
+         fontsize=7, color='#8b949e', va='top', ha='right')
 
-    axes[1, k].imshow(decoded_frames[:,:,f], cmap='gray', vmin=0, vmax=255)
-    axes[1, k].set_title(f"Decoded F{f+1}\nPSNR={psnr_values[f]:.1f}dB", fontsize=8)
-    axes[1, k].axis('off')
 
-plt.tight_layout()
-plt.savefig("step7_comparison.png", dpi=100, bbox_inches='tight')
+# ── Row 2: Step 2 (frame-type stem) + Step 3 (I-frame recon) ──
+ax2 = fig.add_subplot(8, 4, 5)
+ax2.set_facecolor('#0d1117')
+type_n = [1 if t=='I' else 0 for t in frame_types]
+ax2.stem(range(NF), type_n, markerfmt='C0o', linefmt='C0-', basefmt='#444')
+ax2.set_yticks([0,1]); ax2.set_yticklabels(['P','I'], color='white', fontsize=8)
+ax2.set_xlabel('Frame index', color='#8b949e', fontsize=7)
+ax2.set_title("STEP 2 — Frame Type Assignment\n"
+              "I-frame every 10th (self-contained); P-frames predict from prev.", **TITLE_STYLE)
+ax2.tick_params(colors='#8b949e', labelsize=7); ax2.grid(alpha=0.2)
+for sp in ax2.spines.values(): sp.set_color('#30363d')
+
+Y_orig  = yuv_frames[fi][:,:,0].astype(float)
+Y_recon = reconstruct_iframe(compressed_data[fi], Q_MAT, H, W, BLOCK_SIZE)
+
+ax3a = fig.add_subplot(8, 4, 6)
+ax_off(ax3a, f"STEP 3 — Original Y (Frame {fi+1})\nDCT+Quant+RLE applied to each 8×8 block", Y_orig, vmin=0, vmax=255)
+
+ax3b = fig.add_subplot(8, 4, 7)
+ax_off(ax3b, "Quantised DCT coefficients\n(sparse → efficient RLE)", iframe_Y_quantized[fi])
+
+ax3c = fig.add_subplot(8, 4, 8)
+ax_off(ax3c, f"Reconstructed I-frame\nPSNR={psnr[fi]:.1f} dB", Y_recon, vmin=0, vmax=255)
+
+
+# ── Row 3: Step 4 (residual + motion vectors) ──────────────────
+ax4a = fig.add_subplot(8, 4, 9)
+ax_off(ax4a, f"STEP 4 — P-frame Residual (Frame {fp+1})\nCurrent − Predicted (block matching, ±{SEARCH_RANGE}px)",
+       residuals[fp], cmap='gray')
+
+ax4b = fig.add_subplot(8, 4, 10)
+ax4b.set_facecolor('#0d1117')
+cols,rows = np.meshgrid(np.arange(1,nbw0+1), np.arange(1,nbh0+1))
+ax4b.quiver(cols, rows, mvs0[:,1].reshape(nbh0,nbw0), mvs0[:,0].reshape(nbh0,nbw0),
+            color='#f78166', scale=40)
+ax4b.set_xlim(0,nbw0+1); ax4b.set_ylim(0,nbh0+1); ax4b.invert_yaxis()
+ax4b.set_title(f"Motion Vectors (Frame {fp+1})\nEach arrow = displacement of one 8×8 block", **TITLE_STYLE)
+ax4b.tick_params(colors='#8b949e', labelsize=7)
+for sp in ax4b.spines.values(): sp.set_color('#30363d')
+
+# Residual histogram
+ax4c = fig.add_subplot(8, 4, 11)
+ax4c.set_facecolor('#0d1117')
+ax4c.hist(residuals[fp].flatten(), bins=60, color='#58a6ff', edgecolor='none', density=True)
+ax4c.set_title("Residual Distribution\nPeaked near 0 → compressible", **TITLE_STYLE)
+ax4c.tick_params(colors='#8b949e', labelsize=7)
+for sp in ax4c.spines.values(): sp.set_color('#30363d')
+
+# Reference frame used for prediction
+ax4d = fig.add_subplot(8, 4, 12)
+ax_off(ax4d, f"Reference frame (Frame {fp})\nUsed as predictor for Frame {fp+1}",
+       yuv_frames[fp-1][:,:,0], vmin=0, vmax=255)
+
+
+# ── Row 4: Step 5 (Huffman bit usage + ratio) ──────────────────
+ax5a = fig.add_subplot(8, 2, 9)
+ax5a.set_facecolor('#0d1117')
+x = np.arange(NF)
+ax5a.bar(x, orig_bits,  color='#388bfd', alpha=0.6, label='Uncompressed (8 bit/sym)')
+ax5a.bar(x, enc_bits,   color='#f85149', alpha=0.9, label='Huffman encoded')
+ax5a.set_xlabel('Frame index', color='#8b949e', fontsize=7)
+ax5a.set_ylabel('Bits', color='#8b949e', fontsize=7)
+ax5a.set_title("STEP 5 — Entropy Coding (Huffman)\n"
+               "Frequent symbols → short codes; rare → long codes", **TITLE_STYLE)
+ax5a.legend(fontsize=7, facecolor='#161b22', labelcolor='white')
+ax5a.tick_params(colors='#8b949e', labelsize=7)
+for sp in ax5a.spines.values(): sp.set_color('#30363d')
+
+ax5b = fig.add_subplot(8, 2, 10)
+ax5b.set_facecolor('#0d1117')
+cr_frame = orig_bits / np.maximum(enc_bits,1)
+ax5b.plot(cr_frame, 'o-', color='#3fb950', linewidth=1.5, markersize=4)
+ax5b.set_xlabel('Frame index', color='#8b949e', fontsize=7)
+ax5b.set_ylabel('Compression ratio', color='#8b949e', fontsize=7)
+ax5b.set_title("Huffman Compression Ratio per Frame\nI-frames: larger; P-frames: smaller residuals", **TITLE_STYLE)
+ax5b.tick_params(colors='#8b949e', labelsize=7)
+ax5b.grid(alpha=0.2)
+for sp in ax5b.spines.values(): sp.set_color('#30363d')
+
+
+# ── Row 5: Step 6 (bitstream bar + pie) ────────────────────────
+frame_bits_arr = [bitstream['frames'][f]['total'] for f in range(NF)]
+bar_clr = ['#f85149' if t=='I' else '#388bfd' for t in frame_types]
+
+ax6a = fig.add_subplot(8, 2, 11)
+ax6a.set_facecolor('#0d1117')
+ax6a.bar(range(NF), frame_bits_arr, color=bar_clr)
+ip = mpatches.Patch(color='#f85149', label='I-frame')
+pp = mpatches.Patch(color='#388bfd', label='P-frame')
+ax6a.legend(handles=[ip,pp], fontsize=7, facecolor='#161b22', labelcolor='white')
+ax6a.set_xlabel('Frame index', color='#8b949e', fontsize=7)
+ax6a.set_ylabel('Bits (incl. 72-bit header)', color='#8b949e', fontsize=7)
+ax6a.set_title(f"STEP 6 — Bitstream Formation\n"
+               f"Each frame: 72-bit NAL header + Huffman payload  (Total: {total_bits/8/1024:.1f} KB)", **TITLE_STYLE)
+ax6a.tick_params(colors='#8b949e', labelsize=7)
+for sp in ax6a.spines.values(): sp.set_color('#30363d')
+
+ax6b = fig.add_subplot(8, 2, 12)
+ax6b.set_facecolor('#0d1117')
+saved_kb = max(raw_bytes - total_bits/8, 0)
+ax6b.pie(
+    [total_bits/8, saved_kb],
+    labels=[f"Compressed\n{total_bits/8/1024:.1f} KB", f"Saved\n{saved_kb/1024:.1f} KB"],
+    colors=['#f85149','#3fb950'], autopct='%1.1f%%',
+    textprops=dict(color='white', fontsize=8))
+ax6b.set_title(f"Overall Compression Ratio: {overall_cr:.2f}×\n(Y-channel only)", **TITLE_STYLE)
+
+
+# ── Row 6–7: Step 7 (original vs decoded + PSNR curve) ─────────
+show_f = list(dict.fromkeys([0,1,fi,fp,NF-1]))[:4]
+
+for k,f in enumerate(show_f):
+    ax = fig.add_subplot(8, 8, 8*6 + k + 1)
+    ax_off(ax, f"Orig F{f+1} [{frame_types[f]}]", yuv_frames[f][:,:,0], vmin=0, vmax=255)
+    ax = fig.add_subplot(8, 8, 8*6 + k + 5)
+    ax_off(ax, f"Decoded F{f+1}\n{psnr[f]:.1f} dB", decoded[:,:,f], vmin=0, vmax=255)
+
+fig.text(0.01, 0.205, "STEP 7\nOriginal vs\nDecoded", fontsize=8,
+         color='#3fb950', va='top', fontweight='bold')
+
+ax7 = fig.add_subplot(8, 1, 8)
+ax7.set_facecolor('#0d1117')
+ax7.plot(psnr, 'o-', color='#58a6ff', linewidth=1.5, markersize=4, label='PSNR per frame')
+ax7.axhline(30, color='#f0883e', linestyle='--', linewidth=1, label='30 dB — acceptable')
+ax7.axhline(40, color='#3fb950', linestyle='--', linewidth=1, label='40 dB — excellent')
+i_idx = [f for f,t in enumerate(frame_types) if t=='I']
+ax7.plot(i_idx, psnr[i_idx], 'r^', markersize=7, label='I-frames')
+ax7.set_xlabel('Frame index', color='#8b949e', fontsize=8)
+ax7.set_ylabel('PSNR (dB)', color='#8b949e', fontsize=8)
+ax7.set_title(
+    f"STEP 7 — Decoding & Evaluation  |  "
+    f"Mean PSNR = {overall_psnr:.1f} dB   |   "
+    f"Compression Ratio = {overall_cr:.2f}×   |   "
+    f"Compressed = {total_bits/8/1024:.1f} KB  /  Raw = {raw_bytes/1024:.1f} KB",
+    **TITLE_STYLE)
+ax7.legend(fontsize=8, facecolor='#161b22', labelcolor='white', loc='lower right')
+ax7.tick_params(colors='#8b949e', labelsize=8)
+ax7.grid(alpha=0.2)
+for sp in ax7.spines.values(): sp.set_color('#30363d')
+
+plt.subplots_adjust(left=0.06, right=0.98, top=0.98, bottom=0.03, hspace=0.55, wspace=0.35)
+os.makedirs("outputs", exist_ok=True)
+out_path = "outputs/compression_pipeline_all_steps.png"
+plt.savefig(out_path, dpi=130, bbox_inches='tight', facecolor='#0d1117')
+print(f"✓ Saved: {out_path}")
 plt.show()
-
-# ---- Display: Step 7 - PSNR & Compression Pie ----
-fig, axes = plt.subplots(1, 2, figsize=(13, 4))
-fig.suptitle("Step 7: Evaluation - PSNR & Compression | التقييم النهائي", fontsize=11)
-
-axes[0].plot(psnr_values, 'b-o', linewidth=1.5, markersize=4, label='PSNR')
-axes[0].axhline(30, color='r', linestyle='--', label='30 dB (Acceptable)')
-axes[0].axhline(40, color='g', linestyle='--', label='40 dB (Excellent)')
-i_indices = [f for f, t in enumerate(frame_types) if t == 'I']
-axes[0].plot(i_indices, psnr_values[i_indices], 'r^', markersize=8, label='I-frames')
-axes[0].set_xlabel('Frame Number | رقم الإطار')
-axes[0].set_ylabel('PSNR (dB)')
-axes[0].set_title(f"PSNR per Frame | Mean: {overall_psnr:.2f} dB")
-axes[0].legend(loc='lower right'); axes[0].grid(True)
-
-compressed_kb = total_bitstream_bits / 8
-saved_kb      = max(raw_video_bytes - compressed_kb, 0)
-axes[1].pie(
-    [compressed_kb, saved_kb],
-    labels=[f"Compressed\n{compressed_kb/1024:.1f} KB",
-            f"Saved\n{saved_kb/1024:.1f} KB"],
-    colors=['#E84C4C', '#4CAF50'],
-    autopct='%1.1f%%'
-)
-axes[1].set_title(f"Compression Ratio: {overall_cr:.2f}x")
-
-plt.tight_layout()
-plt.savefig("step7_psnr.png", dpi=100, bbox_inches='tight')
-plt.show()
-print("   Figures saved: step7_comparison.png, step7_psnr.png")
-
-print("\n==> ALL STEPS COMPLETE! All figures are shown.")
