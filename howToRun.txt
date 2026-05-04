@@ -1,5 +1,3 @@
 in python: 
 pip install opencv-python numpy scipy matplotlib
 python video_compression.py
-
-in matlap open: https://matlab.mathworks.com/
