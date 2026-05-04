@@ -174,7 +174,7 @@ def huffman_decode(encoded, huff_dict):
 
 print("==> STEP 1: Reading video and converting to YUV...")
 
-VIDEO_PATH = "nature.mp4"
+VIDEO_PATH = "./Street.mp4"
 
 if not os.path.exists(VIDEO_PATH):
     # Generate synthetic video if file not found
