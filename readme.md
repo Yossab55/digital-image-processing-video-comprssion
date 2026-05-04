@@ -1,4 +1,6 @@
-# Setup
+## Audio & Video processing
+
+## Setup Video
 
 - First install packages
 
@@ -11,3 +13,13 @@
 - Then run the code :)
 
   `python video_compression_gui.py`
+
+## Setup Audio
+
+- Install packages
+
+  `sounddevice numpy opencv-python scipy matplotlib pillow`
+
+- Run the code
+
+  `python Audio_Project.py`
